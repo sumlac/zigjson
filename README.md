@@ -35,7 +35,6 @@ This project focuses on two priorities:
 - `/Users/beast/zig_jsonloads/src/root.zig`: parser library and tests.
 - `/Users/beast/zig_jsonloads/src/main.zig`: small CLI demo.
 - `/Users/beast/zig_jsonloads/src/bench.zig`: microbenchmarks against Zig std JSON parser.
-- `/Users/beast/zig_jsonloads/scripts/compare_python.py`: Zig vs CPython `json.loads` benchmark script.
 - `/Users/beast/zig_jsonloads/build.zig`: build graph and tasks.
 
 ## Build And Run
@@ -52,12 +51,6 @@ Run internal benchmark:
 
 ```bash
 zig build bench -Doptimize=ReleaseFast -- 120000
-```
-
-Run direct Zig-vs-Python benchmark:
-
-```bash
-/Users/beast/zig_jsonloads/scripts/compare_python.py --iterations 120000
 ```
 
 ## API Quick Reference

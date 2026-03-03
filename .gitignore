@@ -1,0 +1,10 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Ignore hidden files by default
+.*
+**/.*
+
+# Keep this file trackable
+!.gitignore
