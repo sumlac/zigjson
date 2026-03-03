@@ -1,59 +1,62 @@
 # zig_jsonloads
 
-A high-performance, Python-compatible `json.loads` implementation in Zig.
+Python-compatible `json.loads` for Zig.
 
-This project focuses on two priorities:
-- Full `json.loads` parity for practical behavior and extension hooks.
-- Extremely low parsing latency for hot paths.
+## Requirements
 
-## Features
+- Zig `0.15.2` or newer
 
-- Python-compatible loader entry points:
-- `loads` for text-like input (rejects UTF-8 BOM like Python `str` input).
-- `loadsBytes` for bytes-like input with UTF-8/16/32 detection and BOM handling.
-- Low-latency variants:
-- `loadsBorrowed` (no input copy, caller keeps input alive).
-- `loadsLeaky` (caller-managed allocator; ideal for arena reset loops).
-- Parity hooks:
-- `parse_int`
-- `parse_float`
-- `parse_constant`
-- `object_hook`
-- `object_pairs_hook` (takes precedence over `object_hook`, matching Python behavior)
-- `decoder` (a `cls`-style override hook)
-- Numeric behavior:
-- Fast-path `i64` parsing.
-- Arbitrary-precision integers via `std.math.big.int.Managed` for larger values.
-- String behavior:
-- `strict_strings` option for Python-style strict control character rules.
-- Unicode escape handling including surrogate pair behavior.
-- Parity for non-finite tokens:
-- `NaN`, `Infinity`, `-Infinity` handling plus configurable rejection/hook handling.
+## Quick Start
 
-## Project Layout
-
-- `/Users/beast/zig_jsonloads/src/root.zig`: parser library and tests.
-- `/Users/beast/zig_jsonloads/src/main.zig`: small CLI demo.
-- `/Users/beast/zig_jsonloads/src/bench.zig`: microbenchmarks against Zig std JSON parser.
-- `/Users/beast/zig_jsonloads/build.zig`: build graph and tasks.
-
-## Build And Run
+Run tests:
 
 ```bash
-cd /Users/beast/zig_jsonloads
 zig build test
+```
+
+Run the CLI with a JSON input:
+
+```bash
 zig build run -- '{"hello":"world"}'
 ```
 
-## Benchmark
+## Library Usage
 
-Run internal benchmark:
+```zig
+const std = @import("std");
+const zig_jsonloads = @import("zig_jsonloads");
 
-```bash
-zig build bench -Doptimize=ReleaseFast -- 120000
+pub fn main() !void {
+    const input = "{\"id\":1,\"name\":\"ada\"}";
+    const parsed = try zig_jsonloads.loads(std.heap.page_allocator, input);
+    defer parsed.deinit();
+}
 ```
 
-## API Quick Reference
+Parse bytes (UTF-8/16/32 with BOM detection):
+
+```zig
+const parsed = try zig_jsonloads.loadsBytes(std.heap.page_allocator, bytes);
+defer parsed.deinit();
+```
+
+Use options:
+
+```zig
+const options = zig_jsonloads.LoadsOptions{
+    .strict_strings = true,
+    .allow_nan = false,
+};
+
+const parsed = try zig_jsonloads.loadsWithOptions(
+    std.heap.page_allocator,
+    input,
+    options,
+);
+defer parsed.deinit();
+```
+
+## API
 
 - `loads(allocator, source)`
 - `loadsWithOptions(allocator, source, options)`
@@ -62,7 +65,8 @@ zig build bench -Doptimize=ReleaseFast -- 120000
 - `loadsBorrowed(allocator, source)`
 - `loadsLeaky(allocator, source, options)`
 
-Core options are in `LoadsOptions`:
+`LoadsOptions` fields:
+
 - `strict_strings`
 - `max_depth`
 - `copy_input`
@@ -74,8 +78,8 @@ Core options are in `LoadsOptions`:
 - `object_pairs_hook`
 - `decoder`
 
-## Development Notes
+## Benchmark
 
-- The parser favors low-allocation and branch-efficient paths for common JSON.
-- Tests in `src/root.zig` validate parity-sensitive behavior.
-- Benchmark output varies run-to-run; compare multiple runs for stable estimates.
+```bash
+zig build bench -Doptimize=ReleaseFast -- 120000
+```
