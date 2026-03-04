@@ -46,6 +46,20 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bench_exe);
 
+    // Differential fuzz helper executable (used by tools/diff_fuzz.py).
+    const fuzz_diff_exe = b.addExecutable(.{
+        .name = "fuzz_diff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig_jsonloads", .module = lib_mod },
+            },
+        }),
+    });
+    b.installArtifact(fuzz_diff_exe);
+
     // `zig build run -- <json>` helper step.
     const run_step = b.step("run", "Run the CLI");
     const run_cmd = b.addRunArtifact(exe);
@@ -57,6 +71,15 @@ pub fn build(b: *std.Build) void {
     const bench_cmd = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&bench_cmd.step);
     if (b.args) |args| bench_cmd.addArgs(args);
+
+    // `zig build fuzz-diff -- <cases>` runs CPython differential fuzzing.
+    const fuzz_step = b.step("fuzz-diff", "Run differential fuzzing against CPython");
+    const fuzz_cmd = b.addSystemCommand(&.{ "python3", "tools/diff_fuzz.py" });
+    fuzz_cmd.step.dependOn(b.getInstallStep());
+    fuzz_cmd.addArg("--zig-bin");
+    fuzz_cmd.addArg(b.getInstallPath(.bin, "fuzz_diff"));
+    if (b.args) |args| fuzz_cmd.addArgs(args);
+    fuzz_step.dependOn(&fuzz_cmd.step);
 
     // Library-root tests (`src/root.zig` test blocks).
     const mod_tests = b.addTest(.{

@@ -161,6 +161,14 @@ fn digestCustom(value: zig_jsonloads.JsonValue) usize {
             }
             break :blk acc;
         },
+        .object_pairs => |pairs| blk: {
+            var acc: usize = pairs.len;
+            for (pairs) |pair| {
+                acc +%= pair.key.len *% 131;
+                acc +%= digestCustom(pair.value);
+            }
+            break :blk acc;
+        },
     };
 }
 

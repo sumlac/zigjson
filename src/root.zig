@@ -32,10 +32,12 @@ pub const JsonValue = union(enum) {
     string: []const u8,
     array: Array,
     object: ObjectMap,
+    object_pairs: []const ObjectPair,
 };
 
 pub const Array = std.array_list.Managed(JsonValue);
 pub const ObjectMap = std.StringArrayHashMap(JsonValue);
+pub const DefaultMaxIntDigits: usize = 4300;
 
 pub const ObjectPair = struct {
     key: []const u8,
@@ -43,14 +45,30 @@ pub const ObjectPair = struct {
 };
 
 pub const ParsedJson = struct {
-    arena: *std.heap.ArenaAllocator,
+    arena: std.heap.ArenaAllocator,
     value: JsonValue,
 
     // Public API: deinit.
     pub fn deinit(self: @This()) void {
-        const allocator = self.arena.child_allocator;
-        self.arena.deinit();
-        allocator.destroy(self.arena);
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
+pub const RawDecoded = struct {
+    value: JsonValue,
+    end: usize,
+};
+
+pub const RawDecodedJson = struct {
+    arena: std.heap.ArenaAllocator,
+    value: JsonValue,
+    end: usize,
+
+    // Public API: deinit.
+    pub fn deinit(self: @This()) void {
+        var arena = self.arena;
+        arena.deinit();
     }
 };
 
@@ -60,6 +78,8 @@ pub const LoadsError = std.mem.Allocator.Error || error{
     DepthLimitExceeded,
     UnexpectedUtf8Bom,
     InvalidEncoding,
+    DuplicateKey,
+    IntegerDigitLimitExceeded,
 };
 
 pub const ParseNumberHook = *const fn (allocator: std.mem.Allocator, literal: []const u8) LoadsError!JsonValue;
@@ -67,6 +87,35 @@ pub const ParseConstantHook = *const fn (allocator: std.mem.Allocator, literal: 
 pub const ObjectHook = *const fn (allocator: std.mem.Allocator, object: JsonValue) LoadsError!JsonValue;
 pub const ObjectPairsHook = *const fn (allocator: std.mem.Allocator, pairs: []const ObjectPair) LoadsError!JsonValue;
 pub const DecoderHook = *const fn (allocator: std.mem.Allocator, source: []const u8, options: LoadsOptions) LoadsError!JsonValue;
+pub const DuplicateKeyPolicy = enum {
+    use_last,
+    use_first,
+    reject,
+    collect_pairs,
+};
+
+pub const ParseErrorCode = enum {
+    syntax_error,
+    trailing_data,
+    depth_limit_exceeded,
+    unexpected_utf8_bom,
+    invalid_encoding,
+    duplicate_key,
+    integer_digit_limit_exceeded,
+};
+
+pub const ParseErrorDetail = struct {
+    code: ParseErrorCode,
+    index: usize,
+    line: usize,
+    column: usize,
+    message: []const u8,
+};
+
+pub const LoadsDetailedResult = union(enum) {
+    success: ParsedJson,
+    failure: ParseErrorDetail,
+};
 
 pub const LoadsOptions = struct {
     /// Python's `strict` argument on `json.loads`.
@@ -78,6 +127,11 @@ pub const LoadsOptions = struct {
     /// Python compatibility default: allow `NaN`, `Infinity`, `-Infinity`.
     /// Set to false to reject them unless `parse_constant` is provided.
     allow_nan: bool = true,
+    /// Duplicate key policy for object parsing.
+    duplicate_key_policy: DuplicateKeyPolicy = .use_last,
+    /// Integer digit guard similar to CPython's `int` limit.
+    /// `null` disables the guard.
+    max_int_digits: ?usize = DefaultMaxIntDigits,
 
     parse_int: ?ParseNumberHook = null,
     parse_float: ?ParseNumberHook = null,
@@ -103,12 +157,9 @@ pub fn loadsWithOptions(
     if (startsWithUtf8Bom(source)) return error.UnexpectedUtf8Bom;
 
     var parsed = ParsedJson{
-        .arena = try allocator.create(std.heap.ArenaAllocator),
+        .arena = std.heap.ArenaAllocator.init(allocator),
         .value = undefined,
     };
-    errdefer allocator.destroy(parsed.arena);
-
-    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer parsed.arena.deinit();
 
     const arena = parsed.arena.allocator();
@@ -130,12 +181,9 @@ pub fn loadsBytesWithOptions(
     options: LoadsOptions,
 ) LoadsError!ParsedJson {
     var parsed = ParsedJson{
-        .arena = try allocator.create(std.heap.ArenaAllocator),
+        .arena = std.heap.ArenaAllocator.init(allocator),
         .value = undefined,
     };
-    errdefer allocator.destroy(parsed.arena);
-
-    parsed.arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer parsed.arena.deinit();
 
     const arena = parsed.arena.allocator();
@@ -166,6 +214,17 @@ pub fn loadsLeaky(
         return decoder(allocator, source, options);
     }
 
+    if (optionsUseFastPath(options)) {
+        var fast = FastParser{
+            .allocator = allocator,
+            .source = source,
+            .index = 0,
+            .max_depth = options.max_depth,
+            .max_int_digits = options.max_int_digits,
+        };
+        return fast.parse();
+    }
+
     var parser = Parser{
         .allocator = allocator,
         .source = source,
@@ -173,6 +232,146 @@ pub fn loadsLeaky(
         .options = options,
     };
     return parser.parse();
+}
+
+/// Parse a single JSON value without requiring end-of-input.
+// Public API: rawDecodeLeaky.
+pub fn rawDecodeLeaky(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: LoadsOptions,
+) LoadsError!RawDecoded {
+    if (startsWithUtf8Bom(source)) return error.UnexpectedUtf8Bom;
+
+    if (options.decoder) |decoder| {
+        const value = try decoder(allocator, source, options);
+        return .{ .value = value, .end = source.len };
+    }
+
+    if (optionsUseFastPath(options)) {
+        var fast = FastParser{
+            .allocator = allocator,
+            .source = source,
+            .index = 0,
+            .max_depth = options.max_depth,
+            .max_int_digits = options.max_int_digits,
+        };
+        const value = try fast.parseSingle();
+        return .{ .value = value, .end = fast.index };
+    }
+
+    var parser = Parser{
+        .allocator = allocator,
+        .source = source,
+        .index = 0,
+        .options = options,
+    };
+    const value = try parser.parseSingle();
+    return .{ .value = value, .end = parser.index };
+}
+
+/// Parse one JSON value and return the parsed value plus end index.
+// Public API: rawDecodeWithOptions.
+pub fn rawDecodeWithOptions(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: LoadsOptions,
+) LoadsError!RawDecodedJson {
+    if (startsWithUtf8Bom(source)) return error.UnexpectedUtf8Bom;
+
+    var parsed = RawDecodedJson{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .value = undefined,
+        .end = 0,
+    };
+    errdefer parsed.arena.deinit();
+
+    var effective = options;
+    const arena = parsed.arena.allocator();
+    const parse_source = if (options.copy_input) try arena.dupe(u8, source) else source;
+    effective.copy_input = false;
+
+    const decoded = try rawDecodeLeaky(arena, parse_source, effective);
+    parsed.value = decoded.value;
+    parsed.end = decoded.end;
+    return parsed;
+}
+
+/// Raw decode with default options.
+// Public API: rawDecode.
+pub fn rawDecode(allocator: std.mem.Allocator, source: []const u8) LoadsError!RawDecodedJson {
+    return rawDecodeWithOptions(allocator, source, .{});
+}
+
+/// Parse with rich error information (line/column/index/message).
+// Public API: loadsDetailed.
+pub fn loadsDetailed(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    options: LoadsOptions,
+) std.mem.Allocator.Error!LoadsDetailedResult {
+    if (startsWithUtf8Bom(source)) {
+        return LoadsDetailedResult{
+            .failure = computeDetail(source, 0, .unexpected_utf8_bom),
+        };
+    }
+
+    const parsed = loadsWithOptions(allocator, source, options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SyntaxError => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .syntax_error) },
+        error.TrailingData => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .trailing_data) },
+        error.DepthLimitExceeded => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .depth_limit_exceeded) },
+        error.InvalidEncoding => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .invalid_encoding) },
+        error.DuplicateKey => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .duplicate_key) },
+        error.IntegerDigitLimitExceeded => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .integer_digit_limit_exceeded) },
+        else => return LoadsDetailedResult{ .failure = estimateFailureDetail(source, options, .syntax_error) },
+    };
+    return LoadsDetailedResult{ .success = parsed };
+}
+
+pub const Decoder = struct {
+    arena: std.heap.ArenaAllocator,
+
+    // Public API: init.
+    pub fn init(allocator: std.mem.Allocator) Decoder {
+        return .{ .arena = std.heap.ArenaAllocator.init(allocator) };
+    }
+
+    // Public API: deinit.
+    pub fn deinit(self: *Decoder) void {
+        self.arena.deinit();
+    }
+
+    // Public API: reset.
+    pub fn reset(self: *Decoder) void {
+        _ = self.arena.reset(.retain_capacity);
+    }
+
+    // Public API: decode.
+    pub fn decode(self: *Decoder, source: []const u8, options: LoadsOptions) LoadsError!JsonValue {
+        return loadsLeaky(self.arena.allocator(), source, options);
+    }
+
+    // Public API: decodeBytes.
+    pub fn decodeBytes(self: *Decoder, source: []const u8, options: LoadsOptions) LoadsError!JsonValue {
+        const utf8 = try decodeJsonBytesToWtf8(self.arena.allocator(), source);
+        var effective = options;
+        effective.copy_input = false;
+        return loadsLeaky(self.arena.allocator(), utf8, effective);
+    }
+};
+
+// Internal helper: optionsUseFastPath.
+fn optionsUseFastPath(options: LoadsOptions) bool {
+    return options.strict_strings and
+        options.allow_nan and
+        options.duplicate_key_policy == .use_last and
+        options.parse_int == null and
+        options.parse_float == null and
+        options.parse_constant == null and
+        options.object_hook == null and
+        options.object_pairs_hook == null and
+        options.decoder == null;
 }
 
 const Encoding = enum {
@@ -331,6 +530,11 @@ const Parser = struct {
         return value;
     }
 
+    // Internal helper: parseSingle.
+    fn parseSingle(self: *Parser) LoadsError!JsonValue {
+        return self.parseValue(0);
+    }
+
     // Internal helper: parseValue.
     fn parseValue(self: *Parser, depth: usize) LoadsError!JsonValue {
         self.skipWhitespace();
@@ -398,9 +602,15 @@ const Parser = struct {
         self.index += 1; // '{'
         self.skipWhitespace();
 
-        if (self.options.object_pairs_hook) |pairs_hook| {
+        if (self.options.object_pairs_hook != null or self.options.duplicate_key_policy == .collect_pairs) {
             var pairs = PairList.init(self.allocator);
             defer pairs.deinit();
+
+            const estimated = if (depth == 0 and self.source.len - self.index > 4096)
+                estimateContainerItems(self.source, self.index, '{', '}')
+            else
+                0;
+            if (estimated > 0) try pairs.ensureTotalCapacity(estimated);
 
             if (!self.consumeByte('}')) {
                 while (true) {
@@ -419,10 +629,24 @@ const Parser = struct {
                 }
             }
 
-            return pairs_hook(self.allocator, pairs.items);
+            if (self.options.object_pairs_hook) |pairs_hook| {
+                return pairs_hook(self.allocator, pairs.items);
+            }
+
+            const owned_pairs = try pairs.toOwnedSlice();
+            var pair_value = JsonValue{ .object_pairs = owned_pairs };
+            if (self.options.object_hook) |hook| {
+                pair_value = try hook(self.allocator, pair_value);
+            }
+            return pair_value;
         }
 
         var object = ObjectMap.init(self.allocator);
+        const estimated = if (depth == 0 and self.source.len - self.index > 4096)
+            estimateContainerItems(self.source, self.index, '{', '}')
+        else
+            0;
+        if (estimated > 0) try object.ensureTotalCapacity(estimated);
 
         if (!self.consumeByte('}')) {
             while (true) {
@@ -435,7 +659,16 @@ const Parser = struct {
                 const value = try self.parseValue(depth + 1);
 
                 const gop = try object.getOrPut(key);
-                gop.value_ptr.* = value;
+                if (gop.found_existing) {
+                    switch (self.options.duplicate_key_policy) {
+                        .use_last => gop.value_ptr.* = value,
+                        .use_first => {},
+                        .reject => return error.DuplicateKey,
+                        .collect_pairs => unreachable,
+                    }
+                } else {
+                    gop.value_ptr.* = value;
+                }
 
                 self.skipWhitespace();
                 if (self.consumeByte('}')) break;
@@ -443,9 +676,9 @@ const Parser = struct {
             }
         }
 
-        const obj_value = JsonValue{ .object = object };
+        var obj_value = JsonValue{ .object = object };
         if (self.options.object_hook) |hook| {
-            return hook(self.allocator, obj_value);
+            obj_value = try hook(self.allocator, obj_value);
         }
         return obj_value;
     }
@@ -458,6 +691,11 @@ const Parser = struct {
         self.skipWhitespace();
 
         var array = Array.init(self.allocator);
+        const estimated = if (depth == 0 and self.source.len - self.index > 4096)
+            estimateContainerItems(self.source, self.index, '[', ']')
+        else
+            0;
+        if (estimated > 0) try array.ensureTotalCapacity(estimated);
 
         if (self.consumeByte(']')) {
             return JsonValue{ .array = array };
@@ -480,29 +718,27 @@ const Parser = struct {
         if (!self.consumeByte('"')) return error.SyntaxError;
 
         const start = self.index;
-        var i = start;
-        while (i < self.source.len) : (i += 1) {
-            const c = self.source[i];
-            if (c == '"') {
-                self.index = i + 1;
-                return self.source[start..i];
-            }
-            if (c == '\\' or (self.options.strict_strings and c < 0x20)) break;
-        }
-
+        const i = firstSpecialInString(self.source, start, self.options.strict_strings);
         if (i >= self.source.len) return error.SyntaxError;
 
+        const special = self.source[i];
+        if (special == '"') {
+            self.index = i + 1;
+            return self.source[start..i];
+        }
+
         var out = ByteList.init(self.allocator);
+        errdefer out.deinit();
+
+        const estimated_len = (i - start) + estimateEscapedStringOutputLen(self.source, i);
+        if (estimated_len > 0) try out.ensureTotalCapacity(estimated_len);
+
         try out.appendSlice(self.source[start..i]);
         self.index = i;
 
         while (self.index < self.source.len) {
             const chunk_start = self.index;
-            var j = chunk_start;
-            while (j < self.source.len) : (j += 1) {
-                const cj = self.source[j];
-                if (cj == '"' or cj == '\\' or (self.options.strict_strings and cj < 0x20)) break;
-            }
+            const j = firstSpecialInString(self.source, chunk_start, self.options.strict_strings);
             if (j > chunk_start) {
                 try out.appendSlice(self.source[chunk_start..j]);
                 self.index = j;
@@ -550,10 +786,9 @@ const Parser = struct {
         const first = try self.parseHex4();
 
         if (first >= 0xD800 and first <= 0xDBFF) {
-            // Pair only if the next escape is a valid low surrogate.
             if (self.index + 6 <= self.source.len and self.source[self.index] == '\\' and self.source[self.index + 1] == 'u') {
                 const second = parseHex4Slice(self.source[self.index + 2 .. self.index + 6]) orelse {
-                    try self.appendCodepoint(out, @as(u21, first));
+                    try appendCodepoint(out, @as(u21, first));
                     return;
                 };
 
@@ -562,25 +797,16 @@ const Parser = struct {
                     const high10: u21 = @as(u21, first - 0xD800);
                     const low10: u21 = @as(u21, second - 0xDC00);
                     const codepoint: u21 = 0x10000 + (high10 << 10) + low10;
-                    try self.appendCodepoint(out, codepoint);
+                    try appendCodepoint(out, codepoint);
                     return;
                 }
             }
 
-            try self.appendCodepoint(out, @as(u21, first));
+            try appendCodepoint(out, @as(u21, first));
             return;
         }
 
-        // Python preserves lone low surrogates too.
-        try self.appendCodepoint(out, @as(u21, first));
-    }
-
-    // Internal helper: appendCodepoint.
-    fn appendCodepoint(self: *Parser, out: *ByteList, cp: u21) LoadsError!void {
-        _ = self;
-        var buf: [4]u8 = undefined;
-        const len = std.unicode.wtf8Encode(cp, &buf) catch return error.SyntaxError;
-        try out.appendSlice(buf[0..len]);
+        try appendCodepoint(out, @as(u21, first));
     }
 
     // Internal helper: parseHex4.
@@ -599,6 +825,7 @@ const Parser = struct {
         var negative = false;
         var int_accum: u64 = 0;
         var int_overflow = false;
+        var int_digits: usize = 0;
 
         if (self.consumeByte('-')) {
             negative = true;
@@ -606,11 +833,13 @@ const Parser = struct {
         }
 
         if (self.consumeByte('0')) {
+            int_digits = 1;
             if (self.index < self.source.len and isDigit(self.source[self.index])) return error.SyntaxError;
         } else {
             const first = self.peek() orelse return error.SyntaxError;
             if (first < '1' or first > '9') return error.SyntaxError;
             while (self.index < self.source.len and isDigit(self.source[self.index])) {
+                int_digits += 1;
                 const digit: u64 = @as(u64, self.source[self.index] - '0');
                 if (!int_overflow) {
                     if (int_accum > (std.math.maxInt(u64) - digit) / 10) {
@@ -659,8 +888,17 @@ const Parser = struct {
             if (self.options.parse_float) |hook| {
                 return hook(self.allocator, number_slice);
             }
+            if (parseFloatFast(number_slice)) |fast| {
+                return JsonValue{ .float = fast };
+            }
             const value = std.fmt.parseFloat(f64, number_slice) catch return error.SyntaxError;
             return JsonValue{ .float = value };
+        }
+
+        if (self.options.max_int_digits) |limit| {
+            if (self.options.parse_int == null and int_digits > limit) {
+                return error.IntegerDigitLimitExceeded;
+            }
         }
 
         if (self.options.parse_int) |hook| {
@@ -693,12 +931,7 @@ const Parser = struct {
 
     // Internal helper: skipWhitespace.
     fn skipWhitespace(self: *Parser) void {
-        while (self.index < self.source.len) {
-            switch (self.source[self.index]) {
-                ' ', '\t', '\n', '\r' => self.index += 1,
-                else => return,
-            }
-        }
+        skipWhitespaceSimd(self.source, &self.index);
     }
 
     // Internal helper: peek.
@@ -722,6 +955,657 @@ const Parser = struct {
             std.mem.eql(u8, self.source[self.index .. self.index + literal.len], literal);
     }
 };
+
+const FastParser = struct {
+    const ByteList = std.array_list.Managed(u8);
+
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    index: usize,
+    max_depth: usize,
+    max_int_digits: ?usize,
+
+    // Internal helper: parse.
+    fn parse(self: *FastParser) LoadsError!JsonValue {
+        const value = try self.parseValue(0);
+        self.skipWhitespace();
+        if (self.index != self.source.len) return error.TrailingData;
+        return value;
+    }
+
+    // Internal helper: parseSingle.
+    fn parseSingle(self: *FastParser) LoadsError!JsonValue {
+        return self.parseValue(0);
+    }
+
+    // Internal helper: parseValue.
+    fn parseValue(self: *FastParser, depth: usize) LoadsError!JsonValue {
+        self.skipWhitespace();
+        const c = self.peek() orelse return error.SyntaxError;
+        return switch (c) {
+            '{' => try self.parseObject(depth),
+            '[' => try self.parseArray(depth),
+            '"' => JsonValue{ .string = try self.parseString() },
+            't' => blk: {
+                if (!self.matchLiteral("true")) return error.SyntaxError;
+                self.index += 4;
+                break :blk JsonValue{ .bool = true };
+            },
+            'f' => blk: {
+                if (!self.matchLiteral("false")) return error.SyntaxError;
+                self.index += 5;
+                break :blk JsonValue{ .bool = false };
+            },
+            'n' => blk: {
+                if (!self.matchLiteral("null")) return error.SyntaxError;
+                self.index += 4;
+                break :blk JsonValue.null;
+            },
+            'N' => blk: {
+                if (!self.matchLiteral("NaN")) return error.SyntaxError;
+                self.index += 3;
+                break :blk JsonValue{ .float = std.math.nan(f64) };
+            },
+            'I' => blk: {
+                if (!self.matchLiteral("Infinity")) return error.SyntaxError;
+                self.index += 8;
+                break :blk JsonValue{ .float = std.math.inf(f64) };
+            },
+            '-' => blk: {
+                if (self.matchLiteral("-Infinity")) {
+                    self.index += 9;
+                    break :blk JsonValue{ .float = -std.math.inf(f64) };
+                }
+                break :blk try self.parseNumber();
+            },
+            '0'...'9' => try self.parseNumber(),
+            else => error.SyntaxError,
+        };
+    }
+
+    // Internal helper: parseObject.
+    fn parseObject(self: *FastParser, depth: usize) LoadsError!JsonValue {
+        if (depth >= self.max_depth) return error.DepthLimitExceeded;
+
+        self.index += 1; // '{'
+        self.skipWhitespace();
+
+        var object = ObjectMap.init(self.allocator);
+        const estimated = if (depth == 0 and self.source.len - self.index > 4096)
+            estimateContainerItems(self.source, self.index, '{', '}')
+        else
+            0;
+        if (estimated > 0) try object.ensureTotalCapacity(estimated);
+
+        if (!self.consumeByte('}')) {
+            while (true) {
+                if (self.peek() != '"') return error.SyntaxError;
+                const key = try self.parseString();
+
+                self.skipWhitespace();
+                if (!self.consumeByte(':')) return error.SyntaxError;
+
+                const value = try self.parseValue(depth + 1);
+                const gop = try object.getOrPut(key);
+                gop.value_ptr.* = value;
+
+                self.skipWhitespace();
+                if (self.consumeByte('}')) break;
+                if (!self.consumeByte(',')) return error.SyntaxError;
+            }
+        }
+
+        return JsonValue{ .object = object };
+    }
+
+    // Internal helper: parseArray.
+    fn parseArray(self: *FastParser, depth: usize) LoadsError!JsonValue {
+        if (depth >= self.max_depth) return error.DepthLimitExceeded;
+
+        self.index += 1; // '['
+        self.skipWhitespace();
+
+        var array = Array.init(self.allocator);
+        const estimated = if (depth == 0 and self.source.len - self.index > 4096)
+            estimateContainerItems(self.source, self.index, '[', ']')
+        else
+            0;
+        if (estimated > 0) try array.ensureTotalCapacity(estimated);
+
+        if (self.consumeByte(']')) {
+            return JsonValue{ .array = array };
+        }
+
+        while (true) {
+            const value = try self.parseValue(depth + 1);
+            try array.append(value);
+
+            self.skipWhitespace();
+            if (self.consumeByte(']')) break;
+            if (!self.consumeByte(',')) return error.SyntaxError;
+        }
+
+        return JsonValue{ .array = array };
+    }
+
+    // Internal helper: parseString.
+    fn parseString(self: *FastParser) LoadsError![]const u8 {
+        if (!self.consumeByte('"')) return error.SyntaxError;
+
+        const start = self.index;
+        const i = firstSpecialInString(self.source, start, true);
+        if (i >= self.source.len) return error.SyntaxError;
+
+        if (self.source[i] == '"') {
+            self.index = i + 1;
+            return self.source[start..i];
+        }
+
+        var out = ByteList.init(self.allocator);
+        errdefer out.deinit();
+
+        const estimated_len = (i - start) + estimateEscapedStringOutputLen(self.source, i);
+        if (estimated_len > 0) try out.ensureTotalCapacity(estimated_len);
+
+        try out.appendSlice(self.source[start..i]);
+        self.index = i;
+
+        while (self.index < self.source.len) {
+            const chunk_start = self.index;
+            const j = firstSpecialInString(self.source, chunk_start, true);
+            if (j > chunk_start) {
+                try out.appendSlice(self.source[chunk_start..j]);
+                self.index = j;
+            }
+
+            if (self.index >= self.source.len) return error.SyntaxError;
+            const c = self.source[self.index];
+            switch (c) {
+                '"' => {
+                    self.index += 1;
+                    return try out.toOwnedSlice();
+                },
+                '\\' => {
+                    self.index += 1;
+                    const esc = self.peek() orelse return error.SyntaxError;
+                    self.index += 1;
+
+                    switch (esc) {
+                        '"' => try out.append('"'),
+                        '\\' => try out.append('\\'),
+                        '/' => try out.append('/'),
+                        'b' => try out.append(0x08),
+                        'f' => try out.append(0x0C),
+                        'n' => try out.append('\n'),
+                        'r' => try out.append('\r'),
+                        't' => try out.append('\t'),
+                        'u' => try self.parseUnicodeEscape(&out),
+                        else => return error.SyntaxError,
+                    }
+                },
+                0...0x1F => return error.SyntaxError,
+                else => unreachable,
+            }
+        }
+
+        return error.SyntaxError;
+    }
+
+    // Internal helper: parseUnicodeEscape.
+    fn parseUnicodeEscape(self: *FastParser, out: *ByteList) LoadsError!void {
+        const first = try self.parseHex4();
+
+        if (first >= 0xD800 and first <= 0xDBFF) {
+            if (self.index + 6 <= self.source.len and self.source[self.index] == '\\' and self.source[self.index + 1] == 'u') {
+                const second = parseHex4Slice(self.source[self.index + 2 .. self.index + 6]) orelse {
+                    try appendCodepoint(out, @as(u21, first));
+                    return;
+                };
+
+                if (second >= 0xDC00 and second <= 0xDFFF) {
+                    self.index += 6;
+                    const high10: u21 = @as(u21, first - 0xD800);
+                    const low10: u21 = @as(u21, second - 0xDC00);
+                    const codepoint: u21 = 0x10000 + (high10 << 10) + low10;
+                    try appendCodepoint(out, codepoint);
+                    return;
+                }
+            }
+
+            try appendCodepoint(out, @as(u21, first));
+            return;
+        }
+
+        try appendCodepoint(out, @as(u21, first));
+    }
+
+    // Internal helper: parseHex4.
+    fn parseHex4(self: *FastParser) LoadsError!u16 {
+        if (self.index + 4 > self.source.len) return error.SyntaxError;
+
+        const slice = self.source[self.index .. self.index + 4];
+        const value = parseHex4Slice(slice) orelse return error.SyntaxError;
+        self.index += 4;
+        return value;
+    }
+
+    // Internal helper: parseNumber.
+    fn parseNumber(self: *FastParser) LoadsError!JsonValue {
+        const start = self.index;
+        var negative = false;
+        var int_accum: u64 = 0;
+        var int_overflow = false;
+        var int_digits: usize = 0;
+
+        if (self.consumeByte('-')) {
+            negative = true;
+            if (self.index >= self.source.len) return error.SyntaxError;
+        }
+
+        if (self.consumeByte('0')) {
+            int_digits = 1;
+            if (self.index < self.source.len and isDigit(self.source[self.index])) return error.SyntaxError;
+        } else {
+            const first = self.peek() orelse return error.SyntaxError;
+            if (first < '1' or first > '9') return error.SyntaxError;
+            while (self.index < self.source.len and isDigit(self.source[self.index])) {
+                int_digits += 1;
+                const digit: u64 = @as(u64, self.source[self.index] - '0');
+                if (!int_overflow) {
+                    if (int_accum > (std.math.maxInt(u64) - digit) / 10) {
+                        int_overflow = true;
+                    } else {
+                        int_accum = int_accum * 10 + digit;
+                    }
+                }
+                self.index += 1;
+            }
+        }
+
+        var is_float = false;
+        if (self.consumeByte('.')) {
+            is_float = true;
+            const first_frac = self.peek() orelse return error.SyntaxError;
+            if (!isDigit(first_frac)) return error.SyntaxError;
+            self.index += 1;
+            while (self.index < self.source.len and isDigit(self.source[self.index])) {
+                self.index += 1;
+            }
+        }
+
+        if (self.index < self.source.len and (self.source[self.index] == 'e' or self.source[self.index] == 'E')) {
+            is_float = true;
+            self.index += 1;
+            if (self.index < self.source.len and (self.source[self.index] == '+' or self.source[self.index] == '-')) {
+                self.index += 1;
+            }
+            const first_exp = self.peek() orelse return error.SyntaxError;
+            if (!isDigit(first_exp)) return error.SyntaxError;
+            self.index += 1;
+            while (self.index < self.source.len and isDigit(self.source[self.index])) {
+                self.index += 1;
+            }
+        }
+
+        const number_slice = self.source[start..self.index];
+        if (is_float) {
+            if (parseFloatFast(number_slice)) |fast| {
+                return JsonValue{ .float = fast };
+            }
+            const value = std.fmt.parseFloat(f64, number_slice) catch return error.SyntaxError;
+            return JsonValue{ .float = value };
+        }
+
+        if (self.max_int_digits) |limit| {
+            if (int_digits > limit) return error.IntegerDigitLimitExceeded;
+        }
+
+        if (!int_overflow) {
+            const max_pos: u64 = @as(u64, @intCast(std.math.maxInt(i64)));
+            if (negative) {
+                const min_magnitude = max_pos + 1;
+                if (int_accum <= max_pos) {
+                    const signed: i64 = -@as(i64, @intCast(int_accum));
+                    return JsonValue{ .integer = .{ .small = signed } };
+                }
+                if (int_accum == min_magnitude) {
+                    return JsonValue{ .integer = .{ .small = std.math.minInt(i64) } };
+                }
+            } else if (int_accum <= max_pos) {
+                return JsonValue{ .integer = .{ .small = @as(i64, @intCast(int_accum)) } };
+            }
+        }
+
+        var big = try std.math.big.int.Managed.init(self.allocator);
+        big.setString(10, number_slice) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidCharacter, error.InvalidBase => return error.SyntaxError,
+        };
+        return JsonValue{ .integer = .{ .big = big } };
+    }
+
+    // Internal helper: skipWhitespace.
+    fn skipWhitespace(self: *FastParser) void {
+        skipWhitespaceSimd(self.source, &self.index);
+    }
+
+    // Internal helper: peek.
+    fn peek(self: *FastParser) ?u8 {
+        if (self.index < self.source.len) return self.source[self.index];
+        return null;
+    }
+
+    // Internal helper: consumeByte.
+    fn consumeByte(self: *FastParser, byte: u8) bool {
+        if (self.index < self.source.len and self.source[self.index] == byte) {
+            self.index += 1;
+            return true;
+        }
+        return false;
+    }
+
+    // Internal helper: matchLiteral.
+    fn matchLiteral(self: *FastParser, literal: []const u8) bool {
+        return self.index + literal.len <= self.source.len and
+            std.mem.eql(u8, self.source[self.index .. self.index + literal.len], literal);
+    }
+};
+
+// Internal helper: appendCodepoint.
+fn appendCodepoint(out: *std.array_list.Managed(u8), cp: u21) LoadsError!void {
+    var buf: [4]u8 = undefined;
+    const len = std.unicode.wtf8Encode(cp, &buf) catch return error.SyntaxError;
+    try out.appendSlice(buf[0..len]);
+}
+
+// Internal helper: equalByteBits.
+fn equalByteBits(chunk: u64, byte: u8) u64 {
+    const spread = @as(u64, byte) * 0x0101010101010101;
+    const x = chunk ^ spread;
+    return (x -% 0x0101010101010101) & ~x & 0x8080808080808080;
+}
+
+// Internal helper: controlByteBits.
+fn controlByteBits(chunk: u64) u64 {
+    return (chunk -% 0x2020202020202020) & ~chunk & 0x8080808080808080;
+}
+
+// Internal helper: isWhitespace.
+fn isWhitespace(c: u8) bool {
+    return c == ' ' or c == '\n' or c == '\r' or c == '\t';
+}
+
+// Internal helper: skipWhitespaceSimd.
+fn skipWhitespaceSimd(source: []const u8, index: *usize) void {
+    const full = 0x8080808080808080;
+    var i = index.*;
+
+    // Keep the common no-whitespace path branch-cheap.
+    if (i >= source.len or !isWhitespace(source[i])) {
+        index.* = i;
+        return;
+    }
+
+    while (i + 8 <= source.len) {
+        const chunk = readU64Le(source, i);
+        const ws =
+            equalByteBits(chunk, ' ') |
+            equalByteBits(chunk, '\n') |
+            equalByteBits(chunk, '\r') |
+            equalByteBits(chunk, '\t');
+        if (ws != full) break;
+        i += 8;
+    }
+
+    while (i < source.len and isWhitespace(source[i])) : (i += 1) {}
+    index.* = i;
+}
+
+// Internal helper: firstSpecialInString.
+fn firstSpecialInString(source: []const u8, start: usize, strict_strings: bool) usize {
+    var i = start;
+    while (i + 8 <= source.len) {
+        const chunk = readU64Le(source, i);
+        const quotes = equalByteBits(chunk, '"');
+        const escapes = equalByteBits(chunk, '\\');
+        const ctrls = if (strict_strings) controlByteBits(chunk) else 0;
+        if ((quotes | escapes | ctrls) != 0) break;
+        i += 8;
+    }
+
+    while (i < source.len) : (i += 1) {
+        const c = source[i];
+        if (c == '"' or c == '\\' or (strict_strings and c < 0x20)) return i;
+    }
+    return i;
+}
+
+// Internal helper: readU64Le.
+fn readU64Le(source: []const u8, index: usize) u64 {
+    const ptr: *const [8]u8 = @ptrCast(source[index .. index + 8].ptr);
+    return std.mem.readInt(u64, ptr, .little);
+}
+
+// Internal helper: estimateEscapedStringOutputLen.
+fn estimateEscapedStringOutputLen(source: []const u8, start: usize) usize {
+    var i = start;
+    var out: usize = 0;
+
+    while (i < source.len) {
+        const c = source[i];
+        if (c == '"') return out;
+        if (c == '\\' and i + 1 < source.len) {
+            const esc = source[i + 1];
+            if (esc == 'u' and i + 5 < source.len) {
+                out += 4;
+                i += 6;
+                continue;
+            }
+            out += 1;
+            i += 2;
+            continue;
+        }
+        out += 1;
+        i += 1;
+    }
+    return out;
+}
+
+// Internal helper: estimateContainerItems.
+fn estimateContainerItems(source: []const u8, start: usize, open: u8, close: u8) usize {
+    const scan_limit = @min(source.len, start + 8192);
+    var i = start;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    var commas: usize = 0;
+    var saw_item = false;
+
+    while (i < scan_limit) : (i += 1) {
+        const c = source[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+
+        switch (c) {
+            '"' => in_string = true,
+            '{', '[' => {
+                if (c != open or depth != 0) depth += 1;
+            },
+            '}', ']' => {
+                if (depth == 0 and c == close) {
+                    return if (saw_item) commas + 1 else 0;
+                }
+                if (depth > 0) depth -= 1;
+            },
+            ',' => {
+                if (depth == 0) commas += 1;
+            },
+            ' ', '\n', '\r', '\t' => {},
+            else => {
+                if (depth == 0) saw_item = true;
+            },
+        }
+    }
+    return 0;
+}
+
+// Internal helper: parseFloatFast.
+fn parseFloatFast(slice: []const u8) ?f64 {
+    if (slice.len == 0) return null;
+
+    var i: usize = 0;
+    var negative = false;
+    if (slice[i] == '-') {
+        negative = true;
+        i += 1;
+        if (i >= slice.len) return null;
+    }
+
+    var significand: u64 = 0;
+    var digits: usize = 0;
+    var frac_digits: i32 = 0;
+
+    while (i < slice.len and isDigit(slice[i])) : (i += 1) {
+        if (digits >= 19) return null;
+        significand = significand * 10 + @as(u64, slice[i] - '0');
+        digits += 1;
+    }
+
+    if (i < slice.len and slice[i] == '.') {
+        i += 1;
+        while (i < slice.len and isDigit(slice[i])) : (i += 1) {
+            if (digits < 19) {
+                significand = significand * 10 + @as(u64, slice[i] - '0');
+                digits += 1;
+                frac_digits += 1;
+            } else {
+                return null;
+            }
+        }
+    }
+
+    if (digits == 0) return null;
+
+    var exp10: i32 = -frac_digits;
+    if (i < slice.len and (slice[i] == 'e' or slice[i] == 'E')) {
+        i += 1;
+        if (i >= slice.len) return null;
+
+        var exp_negative = false;
+        if (slice[i] == '+' or slice[i] == '-') {
+            exp_negative = slice[i] == '-';
+            i += 1;
+            if (i >= slice.len) return null;
+        }
+
+        var exp_value: i32 = 0;
+        var exp_digits: usize = 0;
+        while (i < slice.len and isDigit(slice[i])) : (i += 1) {
+            if (exp_value < 10_000) {
+                exp_value = exp_value * 10 + @as(i32, slice[i] - '0');
+            }
+            exp_digits += 1;
+        }
+        if (exp_digits == 0) return null;
+        exp10 += if (exp_negative) -exp_value else exp_value;
+    }
+
+    if (i != slice.len) return null;
+
+    // Fast path only for integer-valued floats that are exactly representable
+    // in f64 (<= 2^53). Everything else falls back to std.fmt.parseFloat.
+    while (exp10 < 0 and significand % 10 == 0) {
+        significand /= 10;
+        exp10 += 1;
+    }
+    if (exp10 < 0) return null;
+    if (exp10 > 18) return null;
+
+    var int_value = significand;
+    var k: i32 = 0;
+    while (k < exp10) : (k += 1) {
+        if (int_value > std.math.maxInt(u64) / 10) return null;
+        int_value *= 10;
+    }
+
+    if (int_value > 9_007_199_254_740_992) return null; // 2^53
+    const value = @as(f64, @floatFromInt(int_value));
+    return if (negative) -value else value;
+}
+
+// Internal helper: estimateFailureDetail.
+fn estimateFailureDetail(source: []const u8, options: LoadsOptions, code: ParseErrorCode) ParseErrorDetail {
+    const idx = findFailureIndex(source, options);
+    return computeDetail(source, idx, code);
+}
+
+// Internal helper: findFailureIndex.
+fn findFailureIndex(source: []const u8, options: LoadsOptions) usize {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    if (optionsUseFastPath(options)) {
+        var fast = FastParser{
+            .allocator = arena.allocator(),
+            .source = source,
+            .index = 0,
+            .max_depth = options.max_depth,
+            .max_int_digits = options.max_int_digits,
+        };
+        _ = fast.parse() catch return fast.index;
+        return fast.index;
+    }
+
+    var parser = Parser{
+        .allocator = arena.allocator(),
+        .source = source,
+        .index = 0,
+        .options = options,
+    };
+    _ = parser.parse() catch return parser.index;
+    return parser.index;
+}
+
+// Internal helper: computeDetail.
+fn computeDetail(source: []const u8, index: usize, code: ParseErrorCode) ParseErrorDetail {
+    const capped = @min(index, source.len);
+
+    var line: usize = 1;
+    var column: usize = 1;
+    var i: usize = 0;
+    while (i < capped) : (i += 1) {
+        if (source[i] == '\n') {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    return .{
+        .code = code,
+        .index = capped,
+        .line = line,
+        .column = column,
+        .message = switch (code) {
+            .syntax_error => "syntax error",
+            .trailing_data => "trailing data after JSON value",
+            .depth_limit_exceeded => "maximum nesting depth exceeded",
+            .unexpected_utf8_bom => "unexpected UTF-8 BOM for text input",
+            .invalid_encoding => "invalid byte encoding",
+            .duplicate_key => "duplicate object key not allowed by policy",
+            .integer_digit_limit_exceeded => "integer string too long",
+        },
+    };
+}
 
 // Internal helper: parseHex4Slice.
 fn parseHex4Slice(slice: []const u8) ?u16 {
@@ -1014,4 +1898,90 @@ test "loadsBorrowed reuses source bytes and default loads copies" {
     defer copied.deinit();
     const cx = copied.value.object.get("x") orelse return error.TestUnexpectedResult;
     try std.testing.expect(@intFromPtr(cx.string.ptr) != @intFromPtr(source[6..11].ptr));
+}
+
+// Test case coverage for parser parity and safety.
+test "rawDecode returns value and end index" {
+    const decoded = try rawDecode(std.testing.allocator, "  [1,2] tail");
+    defer decoded.deinit();
+
+    try std.testing.expect(decoded.value == .array);
+    try std.testing.expectEqual(@as(usize, 7), decoded.end);
+    try std.testing.expect(decoded.value.array.items[0].integer.eqlI64(1));
+    try std.testing.expect(decoded.value.array.items[1].integer.eqlI64(2));
+}
+
+// Test case coverage for parser parity and safety.
+test "duplicate key policies use_first reject collect_pairs" {
+    const first = try loadsWithOptions(std.testing.allocator, "{\"x\":1,\"x\":2}", .{
+        .duplicate_key_policy = .use_first,
+    });
+    defer first.deinit();
+    try std.testing.expect((first.value.object.get("x") orelse return error.TestUnexpectedResult).integer.eqlI64(1));
+
+    try std.testing.expectError(
+        error.DuplicateKey,
+        loadsWithOptions(std.testing.allocator, "{\"x\":1,\"x\":2}", .{
+            .duplicate_key_policy = .reject,
+        }),
+    );
+
+    const pairs = try loadsWithOptions(std.testing.allocator, "{\"x\":1,\"x\":2}", .{
+        .duplicate_key_policy = .collect_pairs,
+    });
+    defer pairs.deinit();
+    try std.testing.expect(pairs.value == .object_pairs);
+    try std.testing.expectEqual(@as(usize, 2), pairs.value.object_pairs.len);
+    try std.testing.expectEqualStrings("x", pairs.value.object_pairs[0].key);
+    try std.testing.expectEqualStrings("x", pairs.value.object_pairs[1].key);
+}
+
+// Test case coverage for parser parity and safety.
+test "integer digit guard matches configured limits" {
+    try std.testing.expectError(
+        error.IntegerDigitLimitExceeded,
+        loadsWithOptions(std.testing.allocator, "12345", .{
+            .max_int_digits = 4,
+        }),
+    );
+
+    const unlimited = try loadsWithOptions(std.testing.allocator, "12345", .{
+        .max_int_digits = null,
+    });
+    defer unlimited.deinit();
+    try std.testing.expect(unlimited.value.integer.eqlI64(12345));
+}
+
+// Test case coverage for parser parity and safety.
+test "loadsDetailed returns rich syntax and trailing-data diagnostics" {
+    const syntax = try loadsDetailed(std.testing.allocator, "{\"x\":}", .{});
+    switch (syntax) {
+        .failure => |detail| {
+            try std.testing.expect(detail.code == .syntax_error);
+            try std.testing.expect(detail.line == 1);
+            try std.testing.expect(detail.column >= 5);
+            try std.testing.expectEqualStrings("syntax error", detail.message);
+        },
+        .success => return error.TestUnexpectedResult,
+    }
+
+    const trailing = try loadsDetailed(std.testing.allocator, "{} {}", .{});
+    switch (trailing) {
+        .failure => |detail| try std.testing.expect(detail.code == .trailing_data),
+        .success => return error.TestUnexpectedResult,
+    }
+}
+
+// Test case coverage for parser parity and safety.
+test "reusable decoder supports reset and bytes decoding" {
+    var decoder = Decoder.init(std.testing.allocator);
+    defer decoder.deinit();
+
+    const first = try decoder.decode("{\"x\":1}", .{ .copy_input = false });
+    try std.testing.expect((first.object.get("x") orelse return error.TestUnexpectedResult).integer.eqlI64(1));
+
+    decoder.reset();
+    const utf8 = [_]u8{ 0xEF, 0xBB, 0xBF, '{', '"', 'y', '"', ':', '2', '}' };
+    const second = try decoder.decodeBytes(&utf8, .{});
+    try std.testing.expect((second.object.get("y") orelse return error.TestUnexpectedResult).integer.eqlI64(2));
 }
